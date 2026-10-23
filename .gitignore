@@ -1,0 +1,6 @@
+.Rhistory
+.RData
+.Rproj.user/
+_site/
+*_files/
+rapport.html
