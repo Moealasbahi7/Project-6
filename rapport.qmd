@@ -1,0 +1,570 @@
+---
+title: "Quelles marques de whisky écossais référencer et associer ? Structure du marché et segments de consommateurs"
+subtitle: "Projet Data Science sous R — Sujet 6 — Groupe 1"
+author: "Moé Al-Asbahi, Aymeric Bonnans, Victor Premat, Mélissa Treso"
+date: today
+lang: fr
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-summary: "Code R"
+    embed-resources: true
+    fig-width: 8
+    fig-height: 5.5
+execute:
+  warning: false
+  message: false
+bibliography: references.bib
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+library(bayesm)      # données Scotch
+library(FactoMineR)  # ACP, HCPC
+library(factoextra)  # graphiques de l'ACP et de la classification
+library(cluster)     # silhouette
+source("R/fonctions.R")
+
+theme_set(theme_minimal(base_size = 12))
+dir.create("figures", showWarnings = FALSE)   # graphiques exportés pour le résumé exécutif
+set.seed(2026)
+```
+
+# Résumé
+
+Un distributeur de spiritueux veut savoir quelles marques de whisky écossais référencer, placer ensemble et associer en promotion. À partir des achats annuels de 2 218 consommateurs pour 21 marques (enquête Simmons), nous mesurons la pénétration et les co-achats, construisons une carte du marché par ACP et segmentons les consommateurs par classification (CAH de Ward consolidée par les k-moyennes). Le marché est dominé par cinq blends, se structure en quatre familles de marques (blends leaders, blends standard, single malts, blends économiques) et compte une petite minorité de gros acheteurs (7 %), segment très stable, qui fait vivre les marques de niche ; les autres segments, définis par la marque principale, sont moins stables. Principale limite : les données indiquent seulement si une marque a été achetée, sans volume ni prix.
+
+# 1. Contexte et question
+
+Un distributeur de spiritueux veut comprendre comment ses clients consomment les marques de whisky écossais : quelles marques sont en concurrence directe, lesquelles sont consommées ensemble.
+
+**Décisions à éclairer** : composition de l'assortiment, organisation du rayon, ventes croisées, actions de fidélisation.
+
+**Questions** :
+
+1. Quelles sont les parts de pénétration des marques ?
+2. Quelles marques sont consommées ensemble ?
+3. Peut-on représenter les marques sur une carte qui rende compte de leur proximité ?
+4. Existe-t-il des groupes de consommateurs aux répertoires de marques distincts ?
+
+# 2. Données : origine, signification des variables, qualité
+
+```{r}
+#| label: donnees
+donnees_brutes <- charger_donnees(6)   # bayesm::Scotch, voir R/fonctions.R
+
+# Noms de marques lisibles
+noms_marques <- c("Chivas Regal", "Dewar's White Label", "JW Black Label", "J&B",
+                  "JW Red Label", "Autres marques", "Glenlivet", "Cutty Sark",
+                  "Glenfiddich", "Pinch (Haig)", "Clan MacGregor", "Ballantine",
+                  "Macallan", "Passport", "Black & White", "Scoresby Rare",
+                  "Grant's", "Usher's", "White Horse", "Knockando", "The Singleton")
+
+scotch <- as.data.frame(matrice_achats(donnees_brutes))   # contrôle : uniquement des 0 et des 1
+names(scotch) <- noms_marques
+
+n_conso <- nrow(scotch)
+n_marques <- ncol(scotch)
+nb_marques <- rowSums(scotch)   # nombre de marques achetées par consommateur
+
+glimpse(scotch[, 1:6])
+```
+
+- **Origine** : jeu `Scotch` du package `bayesm` [@bayesm], issu d'une enquête Simmons auprès de consommateurs américains de whisky écossais.
+- **Individus** : `r n_conso` consommateurs réels.
+- **Variables** : `r n_marques` variables binaires, une par marque : `1` si le consommateur a acheté la marque au cours de l'année, `0` sinon. « Autres marques » regroupe toutes les marques non listées.
+
+```{r}
+#| label: qualite
+tibble(
+  indicateur = c("Valeurs manquantes", "Valeurs différentes de 0 et 1",
+                 "Consommateurs sans aucun achat", "Lignes en double"),
+  valeur = c(sum(is.na(scotch)), sum(!as.matrix(scotch) %in% c(0, 1)),
+             sum(nb_marques == 0), sum(duplicated(scotch)))
+) |>
+  knitr::kable(col.names = c("Contrôle", "Nombre"))
+```
+
+Les données sont complètes et bien codées. Les lignes « en double » ne sont pas des erreurs : avec 21 variables binaires, beaucoup de consommateurs ont exactement le même répertoire (par exemple, Chivas Regal seule).
+
+**Limites** :
+
+- on sait **si** une marque a été achetée, pas **combien** ni à quel **prix** ;
+- aucune information sur le profil des consommateurs (âge, revenu, lieu d'achat) ;
+- enquête américaine et ancienne : la transposition au marché actuel du distributeur doit être prudente.
+
+**Éthique** : les données sont anonymes et ne contiennent aucune variable sensible ; la segmentation repose uniquement sur le comportement d'achat, comme le recommande le cours.
+
+# 3. Préparation : choix de nettoyage et leur justification
+
+Aucun nettoyage n'est nécessaire (pas de valeur manquante ni aberrante). Deux choix de préparation :
+
+- **Noms des marques** : les noms d'origine (`J...B`, `Black...White`…) sont remplacés par des noms lisibles.
+- **Typologie des marques** : nous ajoutons une variable *illustrative* (non utilisée dans les calculs) qui classe les marques par type. Elle vient de notre connaissance du marché, pas des données, et sert seulement à lire les graphiques.
+
+```{r}
+#| label: typologie
+marques <- tibble(
+  marque = noms_marques,
+  type = c("Blend premium", "Blend standard", "Blend premium", "Blend standard",
+           "Blend standard", "Autres", "Single malt", "Blend standard",
+           "Single malt", "Blend premium", "Blend économique", "Blend standard",
+           "Single malt", "Blend économique", "Blend standard", "Blend économique",
+           "Blend standard", "Blend économique", "Blend standard", "Single malt",
+           "Single malt")
+)
+```
+
+- **Pas de centrage-réduction pour la segmentation** : toutes les variables ont la même unité (0/1). Les réduire donnerait un poids énorme aux marques rares (un acheteur de The Singleton, 1,4 % de pénétration, deviendrait très éloigné de tous les autres). L'ACP de la carte du marché, elle, est normée (section 5.1), car on y compare des corrélations entre marques.
+
+# 4. Exploration
+
+## 4.1 Pénétration des marques
+
+La **pénétration** d'une marque est la part des consommateurs qui l'ont achetée dans l'année.
+
+```{r}
+#| label: penetration
+#| fig-height: 6.5
+marques <- marques |>
+  mutate(acheteurs = colSums(scotch),
+         penetration = acheteurs / n_conso)
+
+marques |>
+  ggplot(aes(x = reorder(marque, penetration), y = penetration, fill = type)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(penetration, accuracy = 0.1)),
+            hjust = -0.1, size = 3.2) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.42)) +
+  labs(x = NULL, y = "Pénétration (% des consommateurs)", fill = "Type",
+       title = "Pénétration annuelle des 21 marques",
+       caption = "Source : bayesm::Scotch, 2 218 consommateurs")
+```
+
+```{r}
+#| label: concentration
+part_9 <- marques |>
+  arrange(desc(acheteurs)) |>
+  mutate(part_cumulee = cumsum(acheteurs) / sum(acheteurs)) |>
+  slice(9) |>
+  pull(part_cumulee)
+nb_petites <- sum(marques$penetration < 0.06)
+```
+
+Le marché est **concentré** : Chivas Regal est achetée par `r pct(marques$penetration[1])` des consommateurs, loin devant Dewar's, JW Black, J&B et JW Red (19 à 23 %). Les 9 premières marques représentent `r pct(part_9)` des achats ; `r nb_petites` marques sur 21 touchent moins de 6 % des consommateurs.
+
+## 4.2 Taille du répertoire
+
+```{r}
+#| label: repertoire
+#| fig-height: 4
+tibble(nb = nb_marques) |>
+  mutate(nb = if_else(nb >= 8, "8 et +", as.character(nb)),
+         nb = factor(nb, levels = c(1:7, "8 et +"))) |>
+  count(nb) |>
+  ggplot(aes(nb, n)) +
+  geom_col(fill = "#2b6c8f") +
+  geom_text(aes(label = n), vjust = -0.3, size = 3.5) +
+  labs(x = "Nombre de marques achetées dans l'année", y = "Nombre de consommateurs",
+       title = "Répertoire de marques par consommateur")
+summary(nb_marques)
+```
+
+`r pct(mean(nb_marques == 1))` des consommateurs n'achètent **qu'une seule marque** et la moitié en achète au plus 2. Seuls `r sum(nb_marques >= 6)` consommateurs (`r pct(mean(nb_marques >= 6), accuracy = 0.1)`) en achètent 6 ou plus.
+
+## 4.3 Fidélité selon la marque
+
+Pour chaque marque : le **taux d'exclusivité** (part de ses acheteurs qui n'achètent aucune autre marque) et la **taille moyenne du répertoire** de ses acheteurs.
+
+```{r}
+#| label: fidelite
+#| fig-height: 6
+marques <- marques |>
+  mutate(exclusivite = map_dbl(marque, \(m) mean(nb_marques[scotch[[m]] == 1] == 1)),
+         repertoire_moyen = map_dbl(marque, \(m) mean(nb_marques[scotch[[m]] == 1])))
+
+marques |>
+  ggplot(aes(penetration, exclusivite, colour = type)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = marque), vjust = -0.8, size = 3, show.legend = FALSE) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Pénétration", y = "Part d'acheteurs exclusifs", colour = "Type",
+       title = "Les grandes marques ont aussi les acheteurs les plus fidèles")
+```
+
+```{r}
+#| label: tab-fidelite
+marques |>
+  arrange(desc(penetration)) |>
+  select(marque, type, penetration, exclusivite, repertoire_moyen) |>
+  knitr::kable(digits = 2, col.names = c("Marque", "Type", "Pénétration",
+                                         "Exclusivité", "Répertoire moyen"))
+```
+
+On retrouve la loi de la **« double peine »** (*double jeopardy*) : les petites marques ont moins d'acheteurs **et** des acheteurs moins fidèles. Les acheteurs de The Singleton, Knockando, White Horse ou Passport achètent en moyenne 7 à 10 marques. Exceptions : « Autres marques » (`r pct(marques$exclusivite[6])` d'exclusifs) et Scoresby Rare (`r pct(marques$exclusivite[16])`).
+
+## 4.4 Marques consommées ensemble
+
+### Corrélations
+
+```{r}
+#| label: correlations
+#| fig-height: 7
+matrice_cor <- cor(scotch)
+ordre <- hclust(as.dist(1 - matrice_cor), method = "ward.D2")$order
+
+matrice_cor[ordre, ordre] |>
+  as_tibble(rownames = "marque_1") |>
+  pivot_longer(-marque_1, names_to = "marque_2", values_to = "r") |>
+  mutate(r = if_else(marque_1 == marque_2, NA_real_, r),
+         marque_1 = factor(marque_1, levels = noms_marques[ordre]),
+         marque_2 = factor(marque_2, levels = noms_marques[ordre])) |>
+  ggplot(aes(marque_1, marque_2, fill = r)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#b2182b", mid = "white", high = "#2166ac",
+                       midpoint = 0, na.value = "grey90", limits = c(-0.4, 0.4)) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = NULL, y = NULL, fill = "Corrélation",
+       title = "Corrélations entre achats de marques")
+```
+
+Les corrélations sont faibles (maximum `r num(max(matrice_cor[upper.tri(matrice_cor)]), 2)`), ce qui est normal pour des variables binaires rares, et presque toutes positives : certains clients achètent simplement plus de marques que d'autres.
+
+### Indice d'affinité (lift)
+
+Pour neutraliser la taille des marques, on calcule le **lift** de deux marques A et B :
+$$\text{lift}(A, B) = \frac{P(A \text{ et } B)}{P(A) \times P(B)}$$
+Un lift de 2 signifie que les deux marques sont achetées ensemble deux fois plus souvent que si les achats étaient indépendants (lift = 1).
+
+```{r}
+#| label: lift
+co_achat <- crossprod(as.matrix(scotch))       # nombre d'acheteurs communs
+lift <- indice_lift(as.matrix(scotch))         # voir R/fonctions.R
+
+paires <- lift |>
+  as_tibble(rownames = "marque_1") |>
+  pivot_longer(-marque_1, names_to = "marque_2", values_to = "lift") |>
+  mutate(acheteurs_communs = as.vector(t(co_achat))) |>
+  filter(match(marque_1, noms_marques) < match(marque_2, noms_marques),
+         acheteurs_communs >= 30)                # paires assez fréquentes pour être fiables
+
+paires |> slice_max(lift, n = 10) |>
+  knitr::kable(digits = 2, caption = "Les 10 paires les plus affines (≥ 30 acheteurs communs)")
+paires |> slice_min(lift, n = 5) |>
+  knitr::kable(digits = 2, caption = "Les 5 paires les moins associées (≥ 30 acheteurs communs)")
+```
+
+- les **single malts** forment un bloc : un acheteur de Glenlivet achète Glenfiddich `r num(lift["Glenlivet", "Glenfiddich"], 1)` fois plus souvent que la moyenne ;
+- les deux **Johnnie Walker** sont associés (lift `r num(lift["JW Black Label", "JW Red Label"], 2)`), de même que **J&B et Cutty Sark** (lift `r num(lift["J&B", "Cutty Sark"], 2)`) ;
+- **Chivas Regal et « Autres marques »** sont *moins* souvent achetées ensemble qu'au hasard (lift `r num(lift["Chivas Regal", "Autres marques"], 2)`).
+
+# 5. Modélisation / analyse
+
+## 5.1 ACP sur les marques : la carte du marché
+
+**Référence simple** : si les achats de marques étaient indépendants, tous les lifts vaudraient 1 et il n'y aurait aucune structure à cartographier. L'exploration montre le contraire. Pour résumer ces liens sur une carte, nous réalisons une **ACP normée** (`PCA()` de FactoMineR [@lee2008]) avec les 21 marques comme variables actives et le **nombre de marques achetées** comme variable quantitative illustrative.
+
+```{r}
+#| label: acp
+acp_donnees <- scotch |> mutate(nb_marques = nb_marques)
+res_acp <- PCA(acp_donnees, quanti.sup = 22, scale.unit = TRUE, graph = FALSE)
+round(res_acp$eig[1:6, ], 1)
+fviz_eig(res_acp, addlabels = TRUE, ncp = 10) +
+  labs(title = "Éboulis des valeurs propres", x = "Axe", y = "% d'inertie")
+```
+
+**Choix du nombre d'axes** (critères du cours, combinés) : le critère de Kaiser retient `r sum(res_acp$eig[, 1] > 1)` axes, mais l'inertie est très dispersée (21 variables binaires peu corrélées) ; le coude apparaît après l'axe 3. Nous retenons **3 axes** (`r num(res_acp$eig[3, 3], 0)` % de l'inertie), tous interprétables.
+
+```{r}
+#| label: acp-axe1
+round(res_acp$quanti.sup$cor[, 1:3], 2)   # corrélation du nombre de marques avec les axes
+round(res_acp$var$contrib[, 1:3], 1)      # contributions (%) des marques aux axes
+```
+
+- **Axe 1 = effet « taille du répertoire »** : toutes les marques y sont corrélées dans le même sens et la variable illustrative *nombre de marques achetées* lui est corrélée à `r num(res_acp$quanti.sup$cor[1, 1], 2)`. Il oppose les gros acheteurs aux petits et ne dit rien du positionnement des marques.
+- **Axes 2 et 3 = positionnement** : ils sont peu liés au nombre de marques achetées et opposent des familles de marques. C'est sur eux que nous construisons la carte.
+
+```{r}
+#| label: carte
+#| fig-height: 6.5
+figure_cle <- fviz_pca_var(res_acp, axes = c(2, 3), repel = TRUE, invisible = "quanti.sup",
+                           col.var = factor(marques$type),
+                           palette = c("#d95f02", "#7570b3", "#1b9e77", "#e7298a", "#e6ab02"),
+                           legend.title = "Type") +
+  labs(title = "Carte du marché : cercle des corrélations, axes 2 et 3")
+figure_cle
+ggsave("figures/figure-cle.pdf", figure_cle, width = 8, height = 6.5)
+```
+
+```{r}
+#| label: dimdesc
+description <- dimdesc(res_acp, axes = 2:3)
+description$Dim.2$quanti
+description$Dim.3$quanti
+```
+
+Lecture (on n'interprète que les marques bien représentées, voir `res_acp$var$cos2`) :
+
+- **Axe 2** : d'un côté les blends grand public (Chivas, Johnnie Walker, J&B, Cutty Sark, Black & White), de l'autre les single malts (Glenlivet, Glenfiddich, Macallan, Knockando) et « Autres marques ».
+- **Axe 3** : les marques premium (Glenlivet, Glenfiddich, Chivas, JW Black) contre les blends économiques (Scoresby Rare, Usher's, Passport).
+
+Les flèches des petites marques sont courtes : leur position est moins fiable.
+
+## 5.2 Classification des marques
+
+CAH de Ward sur les marques (distance euclidienne entre les variables centrées-réduites, qui revient à une distance fondée sur la corrélation).
+
+```{r}
+#| label: cah-marques
+#| fig-height: 5.5
+cah_marques <- hclust(dist(t(scale(scotch))), method = "ward.D2")
+plot(cah_marques, hang = -1, main = "Dendrogramme des marques (Ward)", xlab = "", sub = "",
+     ylab = "Hauteur", cex = 0.8)
+rect.hclust(cah_marques, k = 4, border = 2:5)
+
+marques <- marques |> mutate(famille = cutree(cah_marques, k = 4))
+marques |>
+  group_by(famille) |>
+  summarise(marques = paste(marque, collapse = ", "))  |>
+  knitr::kable(col.names = c("Famille", "Marques"))
+```
+
+Le saut de hauteur du dendrogramme justifie 4 familles, cohérentes avec la carte :
+
+1. **Blends leaders et premium** : Chivas Regal, Dewar's, JW Black, JW Red, Pinch ;
+2. **Blends standard** : J&B, Cutty Sark, Ballantine, Black & White, White Horse ;
+3. **Single malts et autres marques** : Glenlivet, Glenfiddich, Macallan, Knockando, Autres marques ;
+4. **Blends économiques** : Clan MacGregor, Passport, Scoresby Rare, Grant's, Usher's, The Singleton.
+
+## 5.3 Segmentation des consommateurs
+
+**Méthode** : comme au chapitre 6, ACP puis **HCPC** [@lee2008] : une CAH de Ward sur toutes les composantes de l'ACP, puis une consolidation par les k-moyennes. On utilise ici une ACP **non normée** (voir section 3), ce qui revient à la distance euclidienne sur les 0/1. Contrairement aux k-moyennes seules, le résultat ne dépend pas d'une graine aléatoire.
+
+**Choix du nombre de segments** [@james2021] : coude, silhouette moyenne et saut du dendrogramme, comparés pour HCPC et pour les k-moyennes.
+
+```{r}
+#| label: choix-k
+#| fig-height: 4
+distances_conso <- dist(scotch)
+valeurs_k <- 3:9
+
+choix_k <- map_dfr(valeurs_k, \(k) {
+  set.seed(1)
+  classes_km <- kmeans(scotch, centers = k, nstart = 25)$cluster
+  classes_hcpc <- segmenter(scotch, k)
+  tibble(k = k,
+         methode = c("HCPC (Ward + k-moyennes)", "k-moyennes seules"),
+         silhouette = c(mean(silhouette(classes_hcpc, distances_conso)[, "sil_width"]),
+                        mean(silhouette(classes_km, distances_conso)[, "sil_width"])))
+})
+
+choix_k |>
+  ggplot(aes(k, silhouette, colour = methode)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  scale_x_continuous(breaks = valeurs_k) +
+  labs(x = "Nombre de segments", y = "Silhouette moyenne", colour = NULL,
+       title = "Choix du nombre de segments") +
+  theme(legend.position = "bottom")
+
+fviz_nbclust(scotch, kmeans, method = "wss", nstart = 25, k.max = 9) +
+  labs(title = "Méthode du coude (k-moyennes)", x = "Nombre de segments", y = "Inertie intra")
+```
+
+Aucun critère ne désigne un nombre de segments évident : la silhouette reste faible (autour de 0,2) et augmente régulièrement avec k, et le coude est peu marqué. Les consommateurs ne forment donc pas des groupes très séparés, ce qui est fréquent avec des données binaires où la moitié des individus n'achète qu'une marque. Nous retenons **6 segments**, en privilégiant l'interprétabilité comme le recommande le cours : à 4 ou 5 segments, les amateurs de single malts et les acheteurs d'« autres marques » sont fusionnés alors que la carte montre qu'ils sont distincts ; au-delà de 6, les nouveaux segments sont de petits sous-groupes difficiles à exploiter. La section 6 vérifie ce que vaut ce choix.
+
+```{r}
+#| label: segmentation
+k_retenu <- 6
+segment <- segmenter(scotch, k_retenu)
+
+profils <- scotch |>
+  mutate(segment = segment, nb_marques = nb_marques) |>
+  group_by(segment) |>
+  summarise(effectif = n(),
+            nb_marques_moyen = mean(nb_marques),
+            part_mono_marque = mean(nb_marques == 1),
+            across(all_of(noms_marques), mean))
+
+# Nom de chaque segment : gros acheteurs, ou marque(s) dominante(s)
+nommer_segment <- function(ligne) {
+  taux <- unlist(ligne[noms_marques])
+  top <- names(sort(taux, decreasing = TRUE))
+  if (ligne$nb_marques_moyen > 4) return("Gros acheteurs multi-marques")
+  if (top[1] %in% c("Glenlivet", "Glenfiddich")) return("Amateurs de single malts")
+  if (max(taux) > 0.95) return(paste("Acheteurs", top[1]))
+  paste("Petits acheteurs", top[1], "/", top[2])
+}
+profils <- profils |>
+  mutate(nom = map_chr(seq_len(n()), \(i) nommer_segment(profils[i, ])))
+noms_segments <- profils$nom
+
+profils |>
+  select(nom, effectif, nb_marques_moyen, part_mono_marque) |>
+  mutate(part = effectif / n_conso, .after = effectif) |>
+  arrange(desc(effectif)) |>
+  knitr::kable(digits = 2, col.names = c("Segment", "Effectif", "Part",
+                                         "Nb marques moyen", "Part mono-marque"))
+```
+
+```{r}
+#| label: heatmap-segments
+#| fig-height: 6.5
+figure_segments <- profils |>
+  mutate(nom = paste0(nom, "\n(n = ", effectif, ")")) |>
+  select(nom, all_of(noms_marques)) |>
+  pivot_longer(-nom, names_to = "marque", values_to = "taux") |>
+  mutate(marque = factor(marque, levels = noms_marques[cah_marques$order])) |>
+  ggplot(aes(nom, marque, fill = taux)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = if_else(taux >= 0.1, scales::percent(taux, accuracy = 1), "")),
+            size = 2.8) +
+  scale_fill_gradient(low = "white", high = "#2b6c8f", labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, size = 8)) +
+  labs(x = NULL, y = NULL, fill = "Taux d'achat",
+       title = "Taux d'achat de chaque marque par segment")
+figure_segments
+ggsave("figures/segments.pdf", figure_segments, width = 8, height = 6.5)
+```
+
+Lecture des segments :
+
+- **Petits acheteurs Chivas / JW Black** (le plus grand segment) : 1 à 2 marques, surtout Chivas Regal et Johnnie Walker ; deux sur trois sont mono-marque.
+- **Acheteurs J&B**, **Acheteurs Dewar's**, **Acheteurs « autres marques »** : tous achètent la marque qui donne son nom au segment, avec environ 2 marques en moyenne.
+- **Amateurs de single malts** : tous achètent Glenfiddich et près de la moitié Glenlivet ; répertoire un peu plus large (environ 3 marques).
+- **Gros acheteurs multi-marques** : petit segment (environ 7 %) qui achète en moyenne près de 8 marques ; c'est lui qui fait vivre les petites marques.
+
+# 6. Évaluation : prédictibilité et stabilité
+
+## 6.1 Généralisation à de nouveaux clients (échantillon test)
+
+On découpe les consommateurs en **apprentissage (70 %)** et **test (30 %)**. On segmente l'échantillon d'apprentissage, puis on affecte chaque client test au centre de segment le plus proche. On compare :
+
+- l'accord entre cette affectation et la segmentation obtenue sur toutes les données (**indice de Rand ajusté**, ARI : 1 = partitions identiques, 0 = accord dû au hasard) ;
+- la qualité des segments sur l'échantillon test (silhouette), face à une **référence simple** : la règle « mono-marque / multi-marques ».
+
+```{r}
+#| label: test
+evaluer_sur_test <- function(graine) {
+  set.seed(graine)
+  id_app <- sample(n_conso, round(0.7 * n_conso))
+  test <- scotch[-id_app, ]
+  classes_app <- segmenter(scotch[id_app, ], k_retenu)
+  classes_test <- affecter_au_centre(test, centres_segments(scotch[id_app, ], classes_app))
+  regle_test <- if_else(rowSums(test) == 1, 1, 2)
+  d_test <- dist(test)
+  stab <- stabilite_par_segment(segment[-id_app], classes_test)
+  accord <- ari(classes_test, segment[-id_app])
+  sil_segments <- mean(silhouette(classes_test, d_test)[, "sil_width"])
+  sil_reference <- mean(silhouette(regle_test, d_test)[, "sil_width"])
+  list(global = tibble(graine = graine, ari_test = accord,
+                       silhouette_segments = sil_segments,
+                       silhouette_reference = sil_reference),
+       par_segment = tibble(graine = graine, segment = noms_segments, jaccard = stab))
+}
+
+evaluations <- map(c(1, 42, 123, 2024, 7), evaluer_sur_test)
+resultats_test <- map_dfr(evaluations, "global")
+stabilite_test <- map_dfr(evaluations, "par_segment")
+
+resultats_test |>
+  knitr::kable(digits = 2, col.names = c("Graine", "ARI test / modèle complet",
+                                         "Silhouette segments", "Silhouette référence"))
+```
+
+```{r}
+#| label: test-resume
+resume_test <- resultats_test |> summarise(across(-graine, mean))
+```
+
+- **Face à la référence** : sur l'échantillon test, la silhouette des segments (`r num(resume_test$silhouette_segments, 2)`) est plus du double de celle de la règle mono / multi-marques (`r num(resume_test$silhouette_reference, 2)`) : la segmentation apporte une vraie information.
+- **Accord global moyen** (vérifier la stabilité des résultats est un principe central de la science des données « véridique » selon @yu2024) : l'ARI moyen n'est que de **`r num(resume_test$ari_test, 2)`**, avec de fortes variations selon le découpage. La segmentation dans son ensemble n'est donc que **moyennement stable**.
+
+Pour savoir quels segments sont fiables, on mesure pour chacun l'indice de Jaccard avec le segment le plus ressemblant obtenu sur l'échantillon d'apprentissage (1 = retrouvé à l'identique) :
+
+```{r}
+#| label: stabilite-segments
+stabilite_test |>
+  group_by(segment) |>
+  summarise(moyenne = mean(jaccard), minimum = min(jaccard)) |>
+  arrange(desc(moyenne)) |>
+  knitr::kable(digits = 2, col.names = c("Segment", "Jaccard moyen", "Jaccard minimum"))
+```
+
+Le segment des **gros acheteurs multi-marques** est retrouvé à chaque découpage (Jaccard supérieur à 0,8) : c'est le résultat le plus solide. Les autres segments existent bien, mais leurs frontières bougent d'un échantillon à l'autre : ce sont plutôt des regroupements de clients selon leur marque principale que des groupes nettement séparés. Les recommandations s'appuient donc d'abord sur les résultats robustes (pénétration, co-achats, carte, gros acheteurs).
+
+## 6.2 Stabilité selon la méthode et le nombre de segments
+
+```{r}
+#| label: stabilite
+# k-moyennes seules, avec plusieurs graines
+ari_kmeans <- map_dbl(1:10, \(graine) {
+  set.seed(graine)
+  ari(segment, kmeans(scotch, k_retenu, nstart = 25)$cluster)
+})
+
+# CAH de Ward seule (sans consolidation)
+classes_ward <- cutree(hclust(distances_conso, method = "ward.D2"), k_retenu)
+
+segment_5 <- segmenter(scotch, 5)
+segment_7 <- segmenter(scotch, 7)
+tibble(
+  comparaison = c("k-moyennes seules (10 graines, moyenne)",
+                  "k-moyennes seules (10 graines, minimum)",
+                  "CAH de Ward sans consolidation",
+                  "HCPC avec 5 segments", "HCPC avec 7 segments"),
+  ari = c(mean(ari_kmeans), min(ari_kmeans),
+          ari(segment, classes_ward),
+          ari(segment, segment_5),
+          ari(segment, segment_7))
+) |>
+  knitr::kable(digits = 2, col.names = c("Comparaison avec la segmentation retenue", "ARI"))
+```
+
+- Les k-moyennes seules donnent des partitions très différentes selon la graine : c'est pourquoi nous avons préféré HCPC, dont le résultat est reproductible. Cette instabilité confirme aussi que les groupes sont peu séparés.
+- Passer à 5 ou 7 segments fusionne ou scinde un segment mais conserve l'essentiel de la structure (ARI supérieur à 0,8).
+
+# 7. Conclusions, limites et recommandations
+
+**Message principal** : le marché du whisky écossais repose sur cinq blends leaders aux clients fidèles, s'organise en quatre familles de marques, et les marques de niche dépendent d'une petite minorité de gros acheteurs.
+
+```{r}
+#| label: chiffres-cles
+part_segment <- function(nom) profils$effectif[profils$nom == nom] / n_conso
+```
+
+**Recommandations** :
+
+1. **Sécuriser le socle** : Chivas Regal, Dewar's, JW Black, J&B et JW Red touchent chacune plus de 19 % des clients et ont les clients les plus fidèles ; une rupture ferait perdre des clients mono-marque.
+2. **Organiser le rayon selon les quatre familles** de la carte (blends leaders, blends standard, single malts, blends économiques) pour faciliter le report entre marques proches.
+3. **Ventes croisées** sur les paires à fort lift : coffret Glenlivet + Glenfiddich, offre JW Red + JW Black, J&B à côté de Cutty Sark.
+4. **Un espace single malts** : les malts forment une famille à part sur la carte et un segment d'amateurs (`r pct(part_segment("Amateurs de single malts"))` des clients) ; c'est un levier de montée en gamme.
+5. **Alléger l'offre économique** : Passport, Usher's, Scoresby Rare, Clan MacGregor, Grant's touchent chacune moins de 5 % des clients, surtout des gros acheteurs qui trouveront un substitut. En garder 2 ou 3, dont Scoresby Rare, qui a le noyau fidèle le plus important.
+6. **Fidéliser les gros acheteurs multi-marques** (`r pct(part_segment("Gros acheteurs multi-marques"))` des clients, le segment le plus stable) : peu nombreux mais présents sur toutes les marques, ils sont la cible idéale des dégustations et nouveautés.
+7. **Ne pas négliger les « autres marques »** : elles touchent 19 % des clients, ont la plus forte part d'acheteurs exclusifs et forment un segment (`r pct(part_segment("Acheteurs Autres marques"))`) éloigné des leaders : marques alternatives ou marque propre.
+
+**Limites** :
+
+- données binaires : ni volumes, ni prix, ni marges ; impossible de chiffrer l'impact financier ;
+- segmentation des consommateurs moyennement stable : seul le segment des gros acheteurs est robuste ;
+- pas de profil sociodémographique : on ne peut pas cibler les segments par âge ou revenu ;
+- la carte (axes 2 et 3) ne résume que `r num(res_acp$eig[2, 2] + res_acp$eig[3, 2], 0)` % de l'inertie : elle montre les grandes oppositions, pas des distances précises, surtout pour les petites marques ;
+- la typologie des marques (premium, économique…) est la nôtre et doit être validée par le distributeur ;
+- enquête américaine et ancienne.
+
+**Prochaine étape** : croiser ces résultats avec les ventes, prix et marges du distributeur.
+
+# Références
+
+::: {#refs}
+:::
+
+# Annexe : sessionInfo()
+
+```{r}
+#| label: session
+sessionInfo()
+```
