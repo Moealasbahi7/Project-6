@@ -271,8 +271,9 @@ paires |> slice_min(lift, n = 5) |>
 ```{r}
 #| label: acp
 acp_donnees <- scotch |> mutate(nb_marques = nb_marques)
-res_acp <- PCA(acp_donnees, quanti.sup = 22, scale.unit = TRUE, graph = FALSE)
-round(res_acp$eig[1:6, ], 1)
+res_acp <- PCA(acp_donnees, quanti.sup = 22, scale.unit = TRUE,
+               ncp = n_marques, graph = FALSE)   # garder tous les axes
+round(head(res_acp$eig, 6), 1)
 fviz_eig(res_acp, addlabels = TRUE, ncp = 10) +
   labs(title = "Éboulis des valeurs propres", x = "Axe", y = "% d'inertie")
 ```
