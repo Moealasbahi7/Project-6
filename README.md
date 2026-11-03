@@ -59,3 +59,4 @@ codées 1 si la marque a été achetée dans l'année, 0 sinon.
 | `resume-executif.tex` / `.pdf` | résumé exécutif de 2 pages pour la direction marketing |
 | `references.bib` | références citées |
 | `figures/` | graphiques du résumé exécutif (`figure-cle.pdf` : carte du marché ; `segments.pdf` : profils des segments) |
+| `presentation.pdf` | support de la présentation orale |
